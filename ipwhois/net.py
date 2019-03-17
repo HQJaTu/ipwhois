@@ -883,10 +883,14 @@ class Net:
         except (URLError, socket.timeout, socket.error) as e:
 
             log.debug('HTTP query socket error: {0}'.format(e))
-            if retry_count > 0:
+            if retry_count > 0 and e.code < 400:
 
-                log.debug('HTTP query retrying (count: {0})'.format(
-                    str(retry_count)))
+                # Assumption is:
+                # - Client errors HTTP/4xx
+                # - Server errors HTTP/5xx
+                # are not retryable
+                log.debug('HTTP query result HTTP/{1}, retrying (count: {0})'.format(
+                    retry_count, e.code))
 
                 return self.get_http_raw(
                     url=url, retry_count=retry_count - 1, headers=headers,
@@ -896,7 +900,7 @@ class Net:
             else:
 
                 raise HTTPLookupError('HTTP lookup failed for {0}.'.format(
-                    url))
+                    url), e.code, e.fp.read(1000))
 
         except HTTPLookupError as e:  # pragma: no cover
 

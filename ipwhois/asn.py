@@ -21,21 +21,18 @@
 # CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
-
+import os.path
 import re
 import sys
 import copy
+import gzip
+import csv
 import logging
 
 from .exceptions import (NetError, ASNRegistryError, ASNParseError,
                          ASNLookupError, HTTPLookupError, WhoisLookupError,
                          WhoisRateLimitError, ASNOriginLookupError)
-
-if sys.version_info >= (3, 3):  # pragma: no cover
-    from ipaddress import ip_network
-
-else:  # pragma: no cover
-    from ipaddr import IPNetwork as ip_network
+from ipaddress import ip_network
 
 log = logging.getLogger(__name__)
 
@@ -78,8 +75,18 @@ ASN_ORIGIN_HTTP = {
             'source': r'(source):[^\S\n]+(?P<val>.+?)\<',
         }
     },
+    'ipinfo': {
+        'url_free_query': 'https://ipinfo.io/widget/{}',
+        'url_paid_query': 'https://ipinfo.io/{}/json',
+    },
 }
 
+ASN_ORIGIN_DB = {
+    'ipinfo': {
+        'asn_db': 'asn.csv.gz',
+        'country_asn_db': 'country_asn.csv.gz',
+    }
+}
 
 class IPASN:
     """
@@ -557,7 +564,13 @@ class ASNOrigin:
             ipwhois.net.Net
     """
 
-    def __init__(self, net):
+    ASN_SOURCE_WHOIS = 'whois'
+    ASN_SOURCE_HTTP_RADB_OBSOLETED = 'http'
+    ASN_SOURCE_HTTP_RADB = 'http-radb'
+    ASN_SOURCE_HTTP_IPINFO = 'http-ipinfo'
+    ASN_SOURCE_IPINFO_DB = 'ipinfo-db'
+
+    def __init__(self, net, token:str=None, db_file:str=None):
 
         from .net import Net
 
@@ -570,6 +583,9 @@ class ASNOrigin:
 
             raise NetError('The provided net parameter is not an instance of '
                            'ipwhois.net.Net')
+
+        self.ipinfo_token = token
+        self.ipinfo_db_file = db_file
 
     def parse_fields(self, response, fields_dict, net_start=None,
                      net_end=None, field_list=None):
@@ -708,6 +724,31 @@ class ASNOrigin:
 
         return nets
 
+    def _get_nets_radb(self, *args, **kwargs):
+        """
+        Deprecated. This will be removed in a future release.
+        """
+
+        from warnings import warn
+        warn('ASNOrigin._get_nets_radb() has been deprecated and will be '
+             'removed. You should now use ASNOrigin.get_nets_radb().')
+        return self.get_nets_radb(*args, **kwargs)
+
+    def get_nets_ipinfo(self, json_response):
+
+        import json
+
+        parsed = json.loads(json_response)
+
+        nets = []
+        for net_in in parsed['prefixes']:
+            net = {}
+            net['cidr'] = net_in['netblock']
+            net['description'] = '{} ({})'.format(net_in['name'], net_in['id'])
+            nets.append(net)
+
+        return nets
+
     def lookup(self, asn=None, inc_raw=False, retry_count=3, response=None,
                field_list=None, asn_methods=None):
         """
@@ -754,14 +795,20 @@ class ASNOrigin:
 
         if asn_methods is None:
 
-            lookups = ['whois', 'http']
+            lookups = [self.ASN_SOURCE_WHOIS, self.ASN_SOURCE_HTTP_RADB]
 
         else:
 
-            if {'whois', 'http'}.isdisjoint(asn_methods):
+            suggested_methods = {self.ASN_SOURCE_WHOIS,
+                                 self.ASN_SOURCE_HTTP_RADB,
+                                 self.ASN_SOURCE_HTTP_IPINFO,
+                                 self.ASN_SOURCE_IPINFO_DB}
+            allowed_methods = suggested_methods.copy()
+            allowed_methods.add(self.ASN_SOURCE_HTTP_RADB_OBSOLETED)
+            if allowed_methods.isdisjoint(asn_methods):
 
                 raise ValueError('methods argument requires at least one of '
-                                 'whois, http.')
+                                 '%s.' % ', '.join(suggested_methods))
 
             lookups = asn_methods
 
@@ -772,14 +819,14 @@ class ASNOrigin:
             'raw': None
         }
 
-        is_http = False
+        response_from = None
 
         # Only fetch the response if we haven't already.
         if response is None:
 
             for index, lookup_method in enumerate(lookups):
 
-                if lookup_method == 'whois':
+                if lookup_method == self.ASN_SOURCE_WHOIS:
 
                     try:
 
@@ -791,6 +838,7 @@ class ASNOrigin:
                             asn=asn, retry_count=retry_count
                         )
 
+                        response_from = lookup_method
                         break
 
                     except (WhoisLookupError, WhoisRateLimitError) as e:
@@ -799,7 +847,7 @@ class ASNOrigin:
                                   ''.format(e))
                         pass
 
-                elif lookup_method == 'http':
+                elif lookup_method in (self.ASN_SOURCE_HTTP_RADB, self.ASN_SOURCE_HTTP_RADB_OBSOLETED):
 
                     try:
 
@@ -818,8 +866,7 @@ class ASNOrigin:
                             request_type='GET',
                             # form_data=tmp
                         )
-                        is_http = True   # pragma: no cover
-
+                        response_from = self.ASN_SOURCE_HTTP_RADB
                         break
 
                     except HTTPLookupError as e:
@@ -828,10 +875,147 @@ class ASNOrigin:
                                   ''.format(e))
                         pass
 
+                elif lookup_method == self.ASN_SOURCE_HTTP_IPINFO:
+
+                    # https://ipinfo.io/AS32097
+                    # https://superuser.com/a/978189/155147
+                    log.debug('Response not given, perform ASN origin '
+                              'HTTP lookup for: {0}'.format(asn))
+
+                    if self.ipinfo_token:
+                        query_url = ASN_ORIGIN_HTTP['ipinfo']['url_paid_query'].format(asn)
+                        auth_header = {
+                            'Accept': '*/*',
+                            'Authorization': 'Bearer {}'.format(self.ipinfo_token)
+                        }
+                        log.debug("Going into ipinfo.io (paid)")
+                    else:
+
+                        # Free API requires some headers to be set to avoid HTTP/404.
+                        # HTTP/429 response is returned when free quota is exceeded.
+                        query_url = ASN_ORIGIN_HTTP['ipinfo']['url_free_query'].format(asn)
+                        auth_header = {
+                            'Accept': '*/*',
+                            'Referer': 'https://ipinfo.io/',
+                            'User-Agent': 'ipwhois/asn.py'
+                        }
+                        retry_count = 0 # Free API-queries have strict quota, don't flood it!
+                        log.debug("Going into ipinfo.io (free)")
+
+                    try:
+
+                        response = self._net.get_http_raw(
+                            url=query_url,
+                            headers=auth_header,
+                            retry_count=retry_count,
+                            request_type='GET'
+                        )
+
+                        response_from = lookup_method
+                        break
+
+                    except HTTPLookupError as e:
+
+                        if e.http_status_code == 401:
+                            if b'Token does not have access to this API' in e.body:
+                                log.debug('ASN origin HTTP lookup failed. Token is valid, '
+                                          'but not this API-request is not supported. Exception: {0}'.format(e))
+                            else:
+                                log.debug('ASN origin HTTP lookup failed. Invalid token? Exception: {0}'.format(e))
+                        else:
+                            log.debug('ASN origin HTTP lookup failed: {0}'.format(e))
+                        pass
+
+                elif lookup_method == self.ASN_SOURCE_IPINFO_DB:
+                    if not self.ipinfo_db_file:
+                        log.debug("Cannot do IPinfo.io DB lookup. No DB-file given.")
+                        break
+                    if not os.path.exists(self.ipinfo_db_file):
+                        log.debug("Cannot do IPinfo.io DB lookup. "
+                                  "Given DB-file {} doesn't exist.".format(self.ipinfo_db_file))
+                        break
+
+                    from ipaddress import (IPv4Address, IPv6Address,
+                                           AddressValueError, summarize_address_range,
+                                           IPv4Network, IPv6Network)
+                    prefixes = []
+
+                    def _ip_helper(start:str, end:str):
+                        if '.' in start:
+                            ip_start = IPv4Address(start)
+                            ip_end = IPv4Address(end)
+                            for pref in summarize_address_range(ip_start, ip_end):
+                                yield pref
+                            return
+
+                        if ':' in start:
+                            ip_start = IPv6Address(start)
+                            ip_end = IPv6Address(end)
+                            for pref in summarize_address_range(ip_start, ip_end):
+                                yield pref
+                            return
+
+                        raise ValueError("Cannot determine if IPv4 or IPv6 address '{}'!".format(start))
+
+                    def _csv_reader(csv_file):
+                        csv_reader = csv.reader(csv_file)
+                        # Row format:
+                        # ASN:
+                        # [start_ip,end_ip,asn,name,domain]
+                        # Country ASN:
+                        # [start_ip,end_ip,country,country_name,continent,continent_name,asn,as_name,as_domain]
+                        for row in csv_reader:
+                            if len(row) == 5:
+                                if asn == row[2]:
+                                    netblock_generator = _ip_helper(row[0], row[1])
+                                    for block in netblock_generator:
+                                        prefix = {
+                                            'netblock': str(block),
+                                            'name': row[3],
+                                            'id': ''
+                                        }
+                                        prefixes.append(prefix)
+                                        #log.debug(row)
+                            elif len(row) == 9:
+                                if asn == row[6]:
+                                    netblock_generator = _ip_helper(row[0], row[1])
+                                    for block in netblock_generator:
+                                        prefix = {
+                                            'netblock': str(block),
+                                            'name': row[7],
+                                            'id': ''
+                                        }
+                                        prefixes.append(prefix)
+                                        #log.debug(row)
+
+                    _, file_extension = os.path.splitext(self.ipinfo_db_file)
+                    if file_extension == '.gz':
+                        with gzip.open(self.ipinfo_db_file, 'rt', encoding='utf-8') as csv_file:
+                            _csv_reader(csv_file)
+                    else:
+                        with open(self.ipinfo_db_file, 'rt', encoding='utf-8') as csv_file:
+                            _csv_reader(csv_file)
+
+                    if prefixes:
+                        response = {
+                            "asn": asn,
+                            'prefixes': prefixes
+                        }
+
+                        import json
+
+                        response = json.dumps(response)
+                        response_from = lookup_method
+                        break
+
             if response is None:
 
                 raise ASNOriginLookupError('ASN origin lookup failed with no '
                                            'more methods to try.')
+
+        else:
+            # Assume response from first method
+            response_from = lookups[0]
 
         # If inc_raw parameter is True, add the response to return dictionary.
         if inc_raw:
@@ -839,39 +1023,48 @@ class ASNOrigin:
             results['raw'] = response
 
         nets = []
-        nets_response = self.get_nets_radb(response, is_http)
+        fields = None
+        if response_from == self.ASN_SOURCE_WHOIS:
+            nets_response = self.get_nets_radb(response, False)
+            fields = ASN_ORIGIN_WHOIS
+        elif response_from == self.ASN_SOURCE_HTTP_RADB:
+            nets_response = self.get_nets_radb(response, True)
+            fields = ASN_ORIGIN_HTTP
+        elif response_from == self.ASN_SOURCE_HTTP_IPINFO:
+            nets_response = self.get_nets_ipinfo(response)
+        elif response_from == self.ASN_SOURCE_IPINFO_DB:
+            nets_response = self.get_nets_ipinfo(response)
+        else:
+            raise ValueError("Internal: Don't know how to process response '{}'!".format(response_from))
 
         nets.extend(nets_response)
 
-        if is_http:   # pragma: no cover
-            fields = ASN_ORIGIN_HTTP
-        else:
-            fields = ASN_ORIGIN_WHOIS
+        if response_from in (self.ASN_SOURCE_WHOIS, self.ASN_SOURCE_HTTP_RADB):
 
-        # Iterate through all of the network sections and parse out the
-        # appropriate fields for each.
-        log.debug('Parsing ASN origin data')
+            # Iterate through all of the network sections and parse out the
+            # appropriate fields for each.
+            log.debug('Parsing ASN origin data')
 
-        for index, net in enumerate(nets):
+            for index, net in enumerate(nets):
 
-            section_end = None
-            if index + 1 < len(nets):
+                section_end = None
+                if index + 1 < len(nets):
 
-                section_end = nets[index + 1]['start']
+                    section_end = nets[index + 1]['start']
 
-            temp_net = self.parse_fields(
-                response,
-                fields['radb']['fields'],
-                section_end,
-                net['end'],
-                field_list
-            )
+                temp_net = self.parse_fields(
+                    response,
+                    fields['radb']['fields'],
+                    section_end,
+                    net['end'],
+                    field_list
+                )
 
-            # Merge the net dictionaries.
-            net.update(temp_net)
+                # Merge the net dictionaries.
+                net.update(temp_net)
 
-            # The start and end values are no longer needed.
-            del net['start'], net['end']
+                # The start and end values are no longer needed.
+                del net['start'], net['end']
 
         # Add the networks to the return dictionary.
         results['nets'] = nets

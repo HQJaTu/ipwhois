@@ -22,6 +22,8 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+from typing import Optional
+
 
 class BaseIpwhoisException(Exception):
     """
@@ -97,6 +99,10 @@ class HTTPLookupError(BaseIpwhoisException):
     An Exception for when the RDAP lookup failed.
     """
 
+    def __init__(self, message = None, http_status_code = None, body: Optional[bytes] = None):
+        super().__init__(self, message)
+        self.http_status_code = http_status_code
+        self.body = body
 
 class HTTPRateLimitError(BaseIpwhoisException):
     """
