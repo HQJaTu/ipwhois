@@ -78,6 +78,10 @@ ASN_ORIGIN_HTTP = {
             'source': r'(source):[^\S\n]+(?P<val>.+?)\<br\>',
         }
     },
+    'ipinfo': {
+        'url_free_query': 'https://ipinfo.io/widget/%s',
+        'url_paid_query': 'https://ipinfo.io/%s/json',
+    },
 }
 
 
@@ -608,6 +612,13 @@ class ASNOrigin:
             ipwhois.net.Net
     """
 
+    ASN_SOURCE_WHOIS = 'whois'
+    ASN_SOURCE_HTTP_RADB_OBSOLETED = 'http'
+    ASN_SOURCE_HTTP_RADB = 'http-radb'
+    ASN_SOURCE_HTTP_IPINFO = 'http-ipinfo'
+
+    ipinfo_token = None
+
     def __init__(self, net):
 
         from .net import Net
@@ -779,6 +790,21 @@ class ASNOrigin:
              'removed. You should now use ASNOrigin.get_nets_radb().')
         return self.get_nets_radb(*args, **kwargs)
 
+    def get_nets_ipinfo(self, json_response):
+
+        import json
+
+        parsed = json.loads(json_response)
+
+        nets = []
+        for net_in in parsed['prefixes']:
+            net = {}
+            net['cidr'] = net_in['netblock']
+            net['description'] = '%s (%s)' % (net_in['name'], net_in['id'])
+            nets.append(net)
+
+        return nets
+
     def lookup(self, asn=None, inc_raw=False, retry_count=3, response=None,
                field_list=None, asn_alts=None, asn_methods=None):
         """
@@ -830,7 +856,7 @@ class ASNOrigin:
 
             if asn_alts is None:
 
-                lookups = ['whois', 'http']
+                lookups = [self.ASN_SOURCE_WHOIS, self.ASN_SOURCE_HTTP_RADB]
 
             else:
 
@@ -842,10 +868,13 @@ class ASNOrigin:
 
         else:
 
-            if {'whois', 'http'}.isdisjoint(asn_methods):
+            suggested_methods = {self.ASN_SOURCE_WHOIS, self.ASN_SOURCE_HTTP_RADB, self.ASN_SOURCE_HTTP_IPINFO}
+            allowed_methods = suggested_methods.copy()
+            allowed_methods.add(self.ASN_SOURCE_HTTP_RADB_OBSOLETED)
+            if allowed_methods.isdisjoint(asn_methods):
 
                 raise ValueError('methods argument requires at least one of '
-                                 'whois, http.')
+                                 '%s.' % ', '.join(suggested_methods))
 
             lookups = asn_methods
 
@@ -856,14 +885,14 @@ class ASNOrigin:
             'raw': None
         }
 
-        is_http = False
+        response_from = None
 
         # Only fetch the response if we haven't already.
         if response is None:
 
             for index, lookup_method in enumerate(lookups):
 
-                if lookup_method == 'whois':
+                if lookup_method == self.ASN_SOURCE_WHOIS:
 
                     try:
 
@@ -875,13 +904,16 @@ class ASNOrigin:
                             asn=asn, retry_count=retry_count
                         )
 
+                        response_from = lookup_method
+                        break
+
                     except (WhoisLookupError, WhoisRateLimitError) as e:
 
                         log.debug('ASN origin WHOIS lookup failed: {0}'
                                   ''.format(e))
                         pass
 
-                elif lookup_method == 'http':
+                elif lookup_method in (self.ASN_SOURCE_HTTP_RADB, self.ASN_SOURCE_HTTP_RADB_OBSOLETED):
 
                     try:
 
@@ -897,7 +929,51 @@ class ASNOrigin:
                             request_type='POST',
                             form_data=tmp
                         )
-                        is_http = True   # pragma: no cover
+                        response_from = self.ASN_SOURCE_HTTP_RADB
+                        break
+
+                    except HTTPLookupError as e:
+
+                        log.debug('ASN origin HTTP lookup failed: {0}'
+                                  ''.format(e))
+                        pass
+
+                elif lookup_method == self.ASN_SOURCE_HTTP_IPINFO:
+
+                    # https://ipinfo.io/AS32097
+                    # https://superuser.com/a/978189/155147
+                    log.debug('Response not given, perform ASN origin '
+                              'HTTP lookup for: {0}'.format(asn))
+
+                    if self.ipinfo_token:
+                        query_url = ASN_ORIGIN_HTTP['ipinfo']['url_paid_query'] % asn
+                        auth_header = {
+                            'Accept': '*/*',
+                            'Authorization': 'Bearer %s' % self.ipinfo_token
+                        }
+                    else:
+
+                        # Free API requires some headers to be set to avoid HTTP/404.
+                        # HTTP/429 response is returned when free quota is exceeded.
+                        query_url = ASN_ORIGIN_HTTP['ipinfo']['url_free_query'] % asn
+                        auth_header = {
+                            'Accept': '*/*',
+                            'Referer': 'https://ipinfo.io/',
+                            'User-Agent': 'ipwhois/asn.py'
+                        }
+                        retry_count = 0 # Free API-queries have strict quota, don't flood it!
+
+                    try:
+
+                        response = self._net.get_http_raw(
+                            url=query_url,
+                            headers=auth_header,
+                            retry_count=retry_count,
+                            request_type='GET'
+                        )
+
+                        response_from = lookup_method
+                        break
 
                     except HTTPLookupError as e:
 
@@ -910,45 +986,54 @@ class ASNOrigin:
                 raise ASNOriginLookupError('ASN origin lookup failed with no '
                                            'more methods to try.')
 
+        else:
+            # Assume response from first method
+            response_from = lookups[0]
+
         # If inc_raw parameter is True, add the response to return dictionary.
         if inc_raw:
 
             results['raw'] = response
 
         nets = []
-        nets_response = self.get_nets_radb(response, is_http)
+        fields = None
+        if response_from == self.ASN_SOURCE_WHOIS:
+            nets_response = self.get_nets_radb(response, False)
+            fields = ASN_ORIGIN_WHOIS
+        elif response_from == self.ASN_SOURCE_HTTP_RADB:
+            nets_response = self.get_nets_radb(response, True)
+            fields = ASN_ORIGIN_HTTP
+        elif response_from == self.ASN_SOURCE_HTTP_IPINFO:
+            nets_response = self.get_nets_ipinfo(response)
 
         nets.extend(nets_response)
 
-        if is_http:   # pragma: no cover
-            fields = ASN_ORIGIN_HTTP
-        else:
-            fields = ASN_ORIGIN_WHOIS
+        if response_from in (self.ASN_SOURCE_WHOIS, self.ASN_SOURCE_HTTP_RADB):
 
-        # Iterate through all of the network sections and parse out the
-        # appropriate fields for each.
-        log.debug('Parsing ASN origin data')
+            # Iterate through all of the network sections and parse out the
+            # appropriate fields for each.
+            log.debug('Parsing ASN origin data')
 
-        for index, net in enumerate(nets):
+            for index, net in enumerate(nets):
 
-            section_end = None
-            if index + 1 < len(nets):
+                section_end = None
+                if index + 1 < len(nets):
 
-                section_end = nets[index + 1]['start']
+                    section_end = nets[index + 1]['start']
 
-            temp_net = self.parse_fields(
-                response,
-                fields['radb']['fields'],
-                section_end,
-                net['end'],
-                field_list
-            )
+                temp_net = self.parse_fields(
+                    response,
+                    fields['radb']['fields'],
+                    section_end,
+                    net['end'],
+                    field_list
+                )
 
-            # Merge the net dictionaries.
-            net.update(temp_net)
+                # Merge the net dictionaries.
+                net.update(temp_net)
 
-            # The start and end values are no longer needed.
-            del net['start'], net['end']
+                # The start and end values are no longer needed.
+                del net['start'], net['end']
 
         # Add the networks to the return dictionary.
         results['nets'] = nets

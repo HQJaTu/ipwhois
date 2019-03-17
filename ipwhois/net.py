@@ -925,7 +925,7 @@ class Net:
             else:
 
                 raise HTTPLookupError('HTTP lookup failed for {0}.'.format(
-                    url))
+                    url), e.code)
 
         except HTTPLookupError as e:  # pragma: no cover
 

@@ -97,6 +97,9 @@ class HTTPLookupError(BaseIpwhoisException):
     An Exception for when the RDAP lookup failed.
     """
 
+    def __init__(self, message = None, http_status_code = None):
+        super().__init__(self, message)
+        self.http_status_code = http_status_code
 
 class HTTPRateLimitError(BaseIpwhoisException):
     """
