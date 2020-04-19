@@ -30,12 +30,7 @@ import logging
 from .exceptions import (NetError, ASNRegistryError, ASNParseError,
                          ASNLookupError, HTTPLookupError, WhoisLookupError,
                          WhoisRateLimitError, ASNOriginLookupError)
-
-if sys.version_info >= (3, 3):  # pragma: no cover
-    from ipaddress import ip_network
-
-else:  # pragma: no cover
-    from ipaddr import IPNetwork as ip_network
+from ipaddress import ip_network
 
 log = logging.getLogger(__name__)
 
@@ -619,7 +614,7 @@ class ASNOrigin:
 
     ipinfo_token = None
 
-    def __init__(self, net):
+    def __init__(self, net, token=None):
 
         from .net import Net
 
@@ -632,6 +627,9 @@ class ASNOrigin:
 
             raise NetError('The provided net parameter is not an instance of '
                            'ipwhois.net.Net')
+
+        if token:
+            self.ipinfo_token = token
 
     def parse_fields(self, response, fields_dict, net_start=None,
                      net_end=None, field_list=None):
@@ -951,6 +949,7 @@ class ASNOrigin:
                             'Accept': '*/*',
                             'Authorization': 'Bearer %s' % self.ipinfo_token
                         }
+                        log.debug("Going into ipinfo.io (paid)")
                     else:
 
                         # Free API requires some headers to be set to avoid HTTP/404.
@@ -962,6 +961,7 @@ class ASNOrigin:
                             'User-Agent': 'ipwhois/asn.py'
                         }
                         retry_count = 0 # Free API-queries have strict quota, don't flood it!
+                        log.debug("Going into ipinfo.io (free)")
 
                     try:
 
